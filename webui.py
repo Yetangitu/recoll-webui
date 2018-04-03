@@ -7,13 +7,20 @@ import sys
 import datetime
 import glob
 import hashlib
-import json
 import csv
 import StringIO
 import ConfigParser
 import string
 import shlex
 import urllib
+
+# use ujson if avalible (faster than built in json)
+try:
+    import ujson as json
+except ImportError:
+    import json
+    print("ujson module not found, using (slower) built-in json module instead")
+
 # import recoll and rclextract
 try:
     from recoll import recoll
@@ -34,7 +41,7 @@ DEFAULTS = {
     'context': 30,
     'stem': 1,
     'timefmt': '%c',
-    'dirdepth': 3,
+    'dirdepth': 2,
     'maxchars': 500,
     'maxresults': 0,
     'perpage': 25,
@@ -149,6 +156,8 @@ def get_query():
         'sort': select([bottle.request.query.get('sort'), SORTS[0][0]]),
         'ascending': int(select([bottle.request.query.get('ascending'), 0])),
         'page': int(select([bottle.request.query.get('page'), 0])),
+        'highlight': int(select([bottle.request.query.get('highlight'), 1])),
+        'snippets': int(select([bottle.request.query.get('snippets'), 1])),
     }
     return query
 #}}}
@@ -183,7 +192,7 @@ class HlMeths:
         return '</span>'
 #}}}
 #{{{ recoll_search
-def recoll_search(q, dosnippets=True):
+def recoll_search(q):
     config = get_config()
     tstart = datetime.datetime.now()
     results = []
@@ -221,8 +230,11 @@ def recoll_search(q, dosnippets=True):
         d['label'] = select([d['title'], d['filename'], '?'], [None, ''])
         d['sha'] = hashlib.sha1(d['url']+d['ipath']).hexdigest()
         d['time'] = timestr(d['mtime'], config['timefmt'])
-        if dosnippets:
-            d['snippet'] = query.makedocabstract(doc, highlighter).encode('utf-8')
+        if q['snippets']:
+            if q['highlight']:
+                d['snippet'] = query.makedocabstract(doc, highlighter).encode('utf-8')
+            else:
+                d['snippet'] = query.makedocabstract(doc).encode('utf-8')
         results.append(d)
     tend = datetime.datetime.now()
     return results, nres, tend - tstart
@@ -315,7 +327,6 @@ def edit(resnum):
 @bottle.route('/json')
 def get_json():
     query = get_query()
-    query['page'] = 0
     qs = query_to_recoll_string(query)
     bottle.response.headers['Content-Type'] = 'application/json'
     bottle.response.headers['Content-Disposition'] = 'attachment; filename=recoll-%s.json' % normalise_filename(qs)
@@ -329,10 +340,11 @@ def get_csv():
     config = get_config()
     query = get_query()
     query['page'] = 0
+    query['snippets'] = 0
     qs = query_to_recoll_string(query)
     bottle.response.headers['Content-Type'] = 'text/csv'
     bottle.response.headers['Content-Disposition'] = 'attachment; filename=recoll-%s.csv' % normalise_filename(qs)
-    res, nres, timer = recoll_search(query, False)
+    res, nres, timer = recoll_search(query)
     si = StringIO.StringIO()
     cw = csv.writer(si)
     fields = config['csvfields'].split()
