@@ -1,4 +1,12 @@
 #!/usr/bin/env python
+#{{{ debug
+# debug
+from __future__ import print_function
+import sys
+
+def eprint(*args, **kwargs):
+    print(*args, file=sys.stderr, **kwargs)
+#}}}
 #{{{ imports
 import os
 import bottle
@@ -107,6 +115,10 @@ def normalise_filename(fn):
         else:
             out += "_"
     return out
+
+def get_topdirs(db):
+    rclconf = rclconfig.RclConfig(os.path.dirname(db))
+    return rclconf.getConfParam('topdirs')
 #}}}
 #{{{ get_config
 def get_config():
@@ -114,8 +126,15 @@ def get_config():
     # get useful things from recoll.conf
     rclconf = rclconfig.RclConfig()
     config['confdir'] = rclconf.getConfDir()
-    config['dirs'] = [os.path.expanduser(d) for d in
-                      shlex.split(rclconf.getConfParam('topdirs'))]
+    config['extradbs'] = []
+    if 'RECOLL_EXTRA_DBS' in os.environ:
+        config['extradbs'] = os.environ.get('RECOLL_EXTRA_DBS').split(':')
+    config['dirs']={}
+    for dir in [os.path.expanduser(d) for d in
+                   shlex.split(rclconf.getConfParam('topdirs'))]:
+        config['dirs'][dir] = os.path.join(config['confdir'], 'xapiandb')
+    # global options as set by the default recoll config are also used for extra databases
+    # when searching the entire set
     config['stemlang'] = rclconf.getConfParam('indexstemminglanguages')
     # get config from cookies or defaults
     for k, v in DEFAULTS.items():
@@ -126,22 +145,27 @@ def get_config():
     ncf = [f for f in cf if f in FIELDS]
     config['csvfields'] = ' '.join(ncf)
     config['fields'] = ' '.join(FIELDS)
+    # get additional databases
+    for e in config['extradbs']:
+        for t in [os.path.expanduser(d) for  d in
+                    shlex.split(get_topdirs(e))]:
+            config['dirs'][t] = e
     # get mountpoints
     config['mounts'] = {}
-    for d in config['dirs']:
+    for d,db in config['dirs'].items():
         name = 'mount_%s' % urllib.quote(d,'')
         config['mounts'][d] = select([bottle.request.get_cookie(name), 'file://%s' % d], [None, ''])
     return config
 #}}}
 #{{{ get_dirs
-def get_dirs(tops, depth):
+def get_dirs(dirs, depth):
     v = []
-    for top in tops:
-        dirs = [top]
+    for dir,d in dirs.items():
+        dirs = [dir]
         for d in range(1, depth+1):
-            dirs = dirs + glob.glob(top + '/*' * d)
+            dirs = dirs + glob.glob(dir + '/*' * d)
         dirs = filter(lambda f: os.path.isdir(f), dirs)
-        top_path = top.rsplit('/', 1)[0]
+        top_path = dir.rsplit('/', 1)[0]
         dirs = [w.replace(top_path+'/', '', 1) for w in dirs]
         v = v + dirs
     return ['<all>'] + v
@@ -173,7 +197,25 @@ def query_to_recoll_string(q):
 #{{{ recoll_initsearch
 def recoll_initsearch(q):
     config = get_config()
-    db = recoll.connect(config['confdir'])
+    """ The reason for this somewhat elaborate scheme is to keep the
+    set size as small as possible by searching only those databases
+    with matching topdirs """
+    if q['dir'] == '<all>':
+        db = recoll.connect(config['confdir'], config['extradbs'])
+    else:
+        dbs=[]
+        for d,db in config['dirs'].items():
+            if os.path.commonprefix([os.path.basename(d),q['dir']]) == q['dir']:
+                dbs.append(db)
+        if len(dbs) == 0: 
+            # should not happen, using non-existing q['dir']?
+            db = recoll.connect(config['confdir'],config['extradbs'])
+        elif len(dbs) == 1:
+            # only one db (most common situation)
+            db = recoll.connect(os.path.dirname(dbs[0]))
+        else:
+            # more than one db with matching topdir, use 'm all
+            db = recoll.connect(dbs[0],dbs[1:])
     db.setAbstractParams(config['maxchars'], config['context'])
     query = db.query()
     query.sortby(q['sort'], q['ascending'])
@@ -195,6 +237,7 @@ class HlMeths:
 def recoll_search(q):
     config = get_config()
     tstart = datetime.datetime.now()
+    highlighter = HlMeths()
     results = []
     query = recoll_initsearch(q)
     nres = query.rowcount
@@ -208,34 +251,33 @@ def recoll_search(q):
         q['page'] = 1
     offset = (q['page'] - 1) * config['perpage']
 
-    if query.rowcount > 0:
+    if query.rowcount > 0 and offset < query.rowcount:
         if type(query.next) == int:
             query.next = offset
         else:
             query.scroll(offset, mode='absolute')
 
-    highlighter = HlMeths()
-    for i in range(config['perpage']):
-        try:
-            doc = query.fetchone()
-        except:
-            break
-        d = {}
-        for f in FIELDS:
-            v = getattr(doc, f)
-            if v is not None:
-                d[f] = v.encode('utf-8')
-            else:
-                d[f] = ''
-        d['label'] = select([d['title'], d['filename'], '?'], [None, ''])
-        d['sha'] = hashlib.sha1(d['url']+d['ipath']).hexdigest()
-        d['time'] = timestr(d['mtime'], config['timefmt'])
-        if q['snippets']:
-            if q['highlight']:
-                d['snippet'] = query.makedocabstract(doc, highlighter).encode('utf-8')
-            else:
-                d['snippet'] = query.makedocabstract(doc).encode('utf-8')
-        results.append(d)
+        for i in range(config['perpage']):
+            try:
+                doc = query.fetchone()
+            except:
+                break
+            d = {}
+            for f in FIELDS:
+                v = getattr(doc, f)
+                if v is not None:
+                    d[f] = v.encode('utf-8')
+                else:
+                    d[f] = ''
+            d['label'] = select([d['title'], d['filename'], '?'], [None, ''])
+            d['sha'] = hashlib.sha1(d['url']+d['ipath']).hexdigest()
+            d['time'] = timestr(d['mtime'], config['timefmt'])
+            if q['snippets']:
+                if q['highlight']:
+                    d['snippet'] = query.makedocabstract(doc, highlighter).encode('utf-8')
+                else:
+                    d['snippet'] = query.makedocabstract(doc).encode('utf-8')
+            results.append(d)
     tend = datetime.datetime.now()
     return results, nres, tend - tstart
 #}}}
@@ -332,7 +374,7 @@ def get_json():
     bottle.response.headers['Content-Disposition'] = 'attachment; filename=recoll-%s.json' % normalise_filename(qs)
     res, nres, timer = recoll_search(query)
 
-    return json.dumps({ 'query': query, 'results': res })
+    return json.dumps({ 'query': query, 'nres': nres, 'results': res })
 #}}}
 #{{{ csv
 @bottle.route('/csv')
@@ -367,7 +409,7 @@ def set():
     config = get_config()
     for k, v in DEFAULTS.items():
         bottle.response.set_cookie(k, str(bottle.request.query.get(k)), max_age=3153600000, expires=315360000)
-    for d in config['dirs']:
+    for d,db in config['dirs'].items():
         cookie_name = 'mount_%s' % urllib.quote(d, '')
         bottle.response.set_cookie(cookie_name, str(bottle.request.query.get('mount_%s' % d)), max_age=3153600000, expires=315360000)
     bottle.redirect('./')
